@@ -2809,10 +2809,9 @@ public:
 			ColumnText("Cooldown duration", "%d", pWnd->CoolDownDuration);
 
 
-			if (ColumnTreeNodeType("Radio Group", "CRadioGroup*", "%s", pWnd->pGroup ? pWnd->pGroup->Name.c_str() : "")
+			if (ColumnTreeNodeType("Radio Group", "CRadioGroup*", "%s", "")
 				&& pWnd->pGroup)
 			{
-				ColumnCXStr("Name", pWnd->pGroup->Name);
 				if (ColumnTreeNodeType("Buttons", "CButtonWnd*[]", "%d", pWnd->pGroup->Buttons.GetLength()))
 				{
 					for (int i = 0; i < pWnd->pGroup->Buttons.GetLength(); ++i)
@@ -4180,7 +4179,7 @@ static void WindowProperties_SpellDisplayWindow(CSidlScreenWnd* pSidlWindow, ImG
 	ColumnText("Display Type", "%d", pWindow->SpellDisplayType);
 	ColumnElapsedTimestamp("Last Update Time", pWindow->LastUpdateTime - EQGetTime());
 #if IS_LIVE_CLIENT
-	ColumnText("Unknown", "%d", pWindow->Unknown);
+	ColumnText("CastAsLevel", "%d", pWindow->CastAsLevel);
 #endif
 }
 
