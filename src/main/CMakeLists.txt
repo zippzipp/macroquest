@@ -10,6 +10,41 @@ include("../Common.cmake")
 # vcpkg dependencies
 # ---------------------------------------------------------------------
 find_package(crashpad REQUIRED)
+
+# ---------------------------------------------------------------------
+# crashpad CRT fix: crashpadConfig.cmake uses find_library() which resolves
+# at configure time. In a multi-config generator (Visual Studio) with no
+# CMAKE_BUILD_TYPE, vcpkg's toolchain puts debug/ paths first in
+# CMAKE_PREFIX_PATH, so find_library picks debug CRT libs for all configs.
+# Fix: replace the unconditional debug-lib link with config-aware paths.
+# ---------------------------------------------------------------------
+if(TARGET crashpad)
+    set(_crashpad_vcpkg_base "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows-static")
+    # Remove the incorrectly-resolved (debug-path) static libs from crashpad's interface
+    get_target_property(_crashpad_iface crashpad INTERFACE_LINK_LIBRARIES)
+    if(_crashpad_iface)
+        set(_crashpad_fixed "")
+        foreach(_lib IN LISTS _crashpad_iface)
+            if(_lib MATCHES "debug[/\\\\]lib[/\\\\](base|client|common|util)\\.lib$")
+                # Skip - we'll re-add with proper debug/release split below
+            else()
+                list(APPEND _crashpad_fixed "${_lib}")
+            endif()
+        endforeach()
+        # Add config-aware generator expressions for the four crashpad static libs
+        foreach(_cpad_lib base client common util)
+            list(APPEND _crashpad_fixed
+                "$<$<CONFIG:Release>:${_crashpad_vcpkg_base}/lib/${_cpad_lib}.lib>"
+                "$<$<CONFIG:Debug>:${_crashpad_vcpkg_base}/debug/lib/${_cpad_lib}.lib>"
+            )
+        endforeach()
+        set_target_properties(crashpad PROPERTIES INTERFACE_LINK_LIBRARIES "${_crashpad_fixed}")
+    endif()
+    unset(_crashpad_iface)
+    unset(_crashpad_fixed)
+    unset(_crashpad_vcpkg_base)
+endif()
+
 find_package(fmt REQUIRED)
 find_package(wil REQUIRED)
 find_package(date REQUIRED)

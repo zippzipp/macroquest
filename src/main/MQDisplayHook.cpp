@@ -214,8 +214,11 @@ static void DisplayHook_Initialize()
 
 		for (int i = 0; i < EQ_LoadingS__ArraySize; i++)
 		{
-			s_oldStrings.emplace_back(ptr[i]);
-			ptr[i] = g_customCaption;
+			if (ptr[i] != nullptr)
+			{
+				s_oldStrings.emplace_back(ptr[i]);
+				ptr[i] = g_customCaption;
+			}
 		}
 	}
 #endif

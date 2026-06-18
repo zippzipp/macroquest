@@ -16,6 +16,9 @@
 
 #include "routing/ServerPostOffice.h"
 
+// HWND requires Windows types
+#include <windows.h>
+
 #include <string>
 #include <optional>
 #include <vector>

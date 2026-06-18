@@ -9,7 +9,12 @@ include("../Common.cmake")
 # ---------------------------------------------------------------------
 # vcpkg dependencies
 # ---------------------------------------------------------------------
-find_package(crashpad REQUIRED)
+# Guard crashpad find_package: src/main may have already imported this target.
+# crashpadConfig.cmake unconditionally calls add_library(crashpad INTERFACE) which
+# CMake policy CMP0002 treats as a fatal duplicate if the target already exists.
+if(NOT TARGET crashpad::crashpad)
+    find_package(crashpad REQUIRED)
+endif()
 find_package(spdlog REQUIRED)
 find_package(wil REQUIRED)
 find_package(date REQUIRED)
@@ -131,6 +136,20 @@ target_compile_options(MacroQuest PRIVATE
 # ---------------------------------------------------------------------
 # Link libraries
 # ---------------------------------------------------------------------
+# Windows SDK libraries required by the loader (sourced from MacroQuest.vcxproj
+# LoaderDependenciesRelease/Debug definitions). These are not provided by any
+# find_package above so must be listed explicitly.
+target_link_libraries(MacroQuest PRIVATE
+    d3d11.lib
+    Setupapi.lib
+    imm32.lib
+    Ws2_32.lib
+    Wldap32.lib
+    version.lib
+)
+# These variables (LoaderDependenciesDebug/Release) are only set if the project
+# was configured from the legacy .vcxproj path; safe to include as they resolve
+# to empty strings when not defined.
 target_link_libraries(MacroQuest PRIVATE
     "$<$<CONFIG:Debug>:${LoaderDependenciesDebug}>"
     "$<$<CONFIG:Release>:${LoaderDependenciesRelease}>"

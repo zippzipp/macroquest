@@ -1187,15 +1187,19 @@ bool MQ2SpawnType::GetMember(SPAWNINFO* pSpawn, const char* Member, char* Index,
 	case SpawnMembers::Owner:
 		if (pSpawn->Mercenary)
 		{
-			size_t pos = strchr(pSpawn->Lastname, '\'') - &pSpawn->Lastname[0];
-			strncpy_s(DataTypeTemp, pSpawn->Lastname, pos);
-
-			DataTypeTemp[pos] = 0;
-
-			if (SPAWNINFO* pOwner = GetSpawnByName(DataTypeTemp))
+			const char* pApostrophe = strchr(pSpawn->Lastname, '\'');
+			if (pApostrophe != nullptr)
 			{
-				Dest = MakeTypeVar(pOwner);
-				return true;
+				size_t pos = pApostrophe - &pSpawn->Lastname[0];
+				strncpy_s(DataTypeTemp, pSpawn->Lastname, pos);
+
+				DataTypeTemp[pos] = 0;
+
+				if (SPAWNINFO* pOwner = GetSpawnByName(DataTypeTemp))
+				{
+					Dest = MakeTypeVar(pOwner);
+					return true;
+				}
 			}
 		}
 		return false;

@@ -1,3 +1,7 @@
 
 # ignore user plugins by default - remove to track your plugins in git
-/*
+# Keep default plugin files
+!.gitignore
+!MQ2Plugin.h
+!README.md
+!mkplugin.exe
