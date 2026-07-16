@@ -1373,30 +1373,67 @@ bool MacroQuest::IsAlias(const std::string& alias) const
 
 bool MacroQuest::ValidateNewPatch(uintptr_t address, size_t numBytes, std::string_view name, const MQPluginHandle& pluginHandle) const
 {
-	eqlib::MemoryPatch* existingPatch = nullptr;
+	// Enumerate EVERY patch overlapping the prospective detour's byte range. FindPatches
+	// returns the TOTAL overlap count but only fills up to the buffer, so we size for "all"
+	// and fail closed if there are somehow more than we can inspect. (A ~20-byte window
+	// realistically overlaps at most a couple patches.)
+	constexpr uint32_t kMaxOverlaps = 32;
+	eqlib::MemoryPatch* overlaps[kMaxOverlaps] = {};
+	const uint32_t count = m_memoryPatcher->FindPatches(address, numBytes, overlaps, kMaxOverlaps);
 
-	if (m_memoryPatcher->FindPatches(address, numBytes, &existingPatch, 1) != 0)
+	if (count == 0)
+		return true;   // nothing overlaps — always OK
+
+	const uint32_t inspected = (count < kMaxOverlaps) ? count : kMaxOverlaps;
+
+	for (uint32_t i = 0; i < inspected; ++i)
 	{
-		if (pluginHandle == mqplugin::ThisPluginHandle || existingPatch->GetUserData() == 0)
+		eqlib::MemoryPatch* p = overlaps[i];
+
+		// A record-only opaque patch (type Patch that writes no bytes — e.g. the memcheck/
+		// CRC-bypass "__compress_block" region) is safe to overlap: it modifies no memory,
+		// and the memcheck substitution reports original bytes for the whole region, so a
+		// detour placed inside is concealed exactly like MQ's own in-region hooks.
+		if (p->GetType() == eqlib::MemoryPatch::Type::Patch && p->GetNewBytesSize() == 0)
+			continue;
+
+		// A conflicting patch the SAME caller already owns at this spot (or an unowned /
+		// core-internal patch) is a benign, idempotent re-attempt — not a cross-plugin
+		// conflict. Reject quietly to avoid log spam (e.g. core re-installing its own detours
+		// like __ProcessDeviceEvents).
+		const uint64_t otherOwner = p->GetUserData();
+		if (otherOwner == 0 || otherOwner == pluginHandle.pluginID)
 			return false;
 
-		MQPlugin* otherPlugin = GetPluginByHandle(MQPluginHandle{ existingPatch->GetUserData() });
+		// Otherwise it is a real code detour, or a byte-writing patch, owned by SOMEONE ELSE:
+		// a genuine byte-level conflict. Reject and report which patch we collided with.
 		MQPlugin* thisPlugin = GetPluginByHandle(pluginHandle);
+		MQPlugin* otherPlugin = (p->GetUserData() != 0)
+			? GetPluginByHandle(MQPluginHandle{ p->GetUserData() }) : nullptr;
+		const std::string_view thisName  = thisPlugin  ? std::string_view(thisPlugin->name)  : std::string_view("(core)");
+		const std::string_view otherName = otherPlugin ? std::string_view(otherPlugin->name) : std::string_view("(core/unowned)");
 
-		if (existingPatch->GetAddress() == address)
-		{
-			LOG_ERROR("Plugin \"{}\" tried to detour address 0x{:X} (\"{}\") but it already exists as another detour created by {}",
-				thisPlugin->name, address, name, otherPlugin ? std::string_view(otherPlugin->name) : std::string_view("(NULL)"));
-		}
-		else
-		{
-			LOG_ERROR("Plugin \"{}\" tried to detour address 0x{:X} (\"{}\") but it conflicts with another detour created by {}",
-				thisPlugin->name, address, name, otherPlugin ? std::string_view(otherPlugin->name) : std::string_view("(NULL)"));
-		}
+		LOG_ERROR("Plugin \"{}\" tried to detour 0x{:X} (\"{}\") but it {} existing {} \"{}\" @ 0x{:X} size={} owner={}",
+			thisName, address, name,
+			p->GetAddress() == address ? "is IDENTICAL to" : "OVERLAPS",
+			p->GetType() == eqlib::MemoryPatch::Type::Detour ? "detour" : "byte-patch",
+			p->GetName(), p->GetAddress(), p->GetBytesSize(), otherName);
 
 		return false;
 	}
 
+	if (count > kMaxOverlaps)
+	{
+		// More overlaps than we can inspect: fail closed rather than risk allowing a hidden
+		// real-detour/byte-patch conflict.
+		MQPlugin* thisPlugin = GetPluginByHandle(pluginHandle);
+		LOG_ERROR("Plugin \"{}\" tried to detour 0x{:X} (\"{}\") but it overlaps {} patches (> {} inspected); refusing conservatively",
+			thisPlugin ? std::string_view(thisPlugin->name) : std::string_view("(core)"),
+			address, name, count, kMaxOverlaps);
+		return false;
+	}
+
+	// Every overlap was a record-only opaque patch — safe to proceed.
 	return true;
 }
 
