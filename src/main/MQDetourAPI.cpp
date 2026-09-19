@@ -466,6 +466,261 @@ static bool IsHooked(uintptr_t addr)
 	return false;
 }
 
+//============================================================================
+// Hook-scanner countermeasure
+//
+// CEverQuest::DoMainLoop contains an unrolled sequence of "check units". Each one
+// loads the first byte of a monitored function, tests it against a list of detour
+// shapes, and -- only if the verdict differs from a stored state byte -- reports
+// the change to the server.
+//
+// Canonical unit shape (2026-09-11 client):
+//
+//     lea   rdx, [rip+disp]          ; or mov reg,[rip+disp], or lea+deref for imports
+//     movzx eax, byte ptr [rdx]      ; <-- the 3 bytes we replace
+//     cmp   al, 0xE9                 ; seven shape tests follow, three out-of-line
+//     ...
+//     xor   al, al                   ; terminal "clean" verdict
+//     cmp   al, byte ptr [rip+disp]  ; <-- the state byte
+//     je    next_unit
+//
+// We replace the movzx with `xor reg,reg; nop`. The loaded byte becomes zero, every
+// shape test fails, and control reaches the terminal xor -- a permanent "clean"
+// verdict. Flags are safe (the next instruction is the cmp, which overwrites them)
+// and the register is not live afterwards.
+//
+// This anchors on the load/compare pair rather than on the branch layout. The
+// previous implementation matched the comparison chain and flipped jne opcodes at
+// fixed deltas {5, 13}; the 2026-09-11 client changed the register (rcx -> rdx/rax,
+// which also introduced cl-form compares) and grew the shape list from two tests to
+// seven, moving every delta. It silently matched zero sites while still logging
+// "Patching". The movzx is the one instruction in a unit that cannot move relative
+// to its own compare.
+//
+// Measured selectivity over the whole image, both builds, zero false positives:
+//     2026-08-13 client: 24 matches, all inside DoMainLoop
+//     2026-09-11 client: 25 matches, all inside DoMainLoop
+//============================================================================
+
+struct HookCheckUnit
+{
+	uintptr_t checkAddress = 0;      // the movzx -- our 3-byte patch site
+	uintptr_t targetAddress = 0;     // the monitored function
+	uintptr_t stateAddress = 0;      // the client's stored verdict byte
+	uint8_t   patchBytes[3] = {};
+	uint8_t   originalBytes[3] = {};
+	bool      patched = false;
+};
+
+static std::vector<HookCheckUnit> s_checkUnits;
+
+static int32_t ReadRel32(uintptr_t address)
+{
+	int32_t value;
+	memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+	return value;
+}
+
+// Decode a check unit at `address`. Returns false for anything that is not an exact
+// structural match, so this is safe to run over every 0F B6 in the image.
+static bool DecodeCheckUnit(uintptr_t address, uintptr_t imageStart, uintptr_t imageEnd, HookCheckUnit& out)
+{
+	const uint8_t* p = reinterpret_cast<const uint8_t*>(address);
+
+	// movzx r32, byte ptr [reg]. mod must be 00 and rm must be a plain register:
+	// rm == 4 would introduce a SIB byte, rm == 5 would be rip-relative.
+	const uint8_t modrm = p[2];
+	if ((modrm >> 6) != 0)
+		return false;
+
+	const uint8_t baseReg = modrm & 7;
+	const uint8_t destReg = (modrm >> 3) & 7;
+	if (baseReg == 4 || baseReg == 5)
+		return false;
+
+	// The compare must follow immediately and must read the register the movzx just
+	// wrote. Only the two encodings the client emits are accepted.
+	if (p[3] == 0x3C && p[4] == 0xE9)                            // cmp al, 0xE9
+	{
+		if (destReg != 0)
+			return false;
+	}
+	else if (p[3] == 0x80 && p[4] == 0xF9 && p[5] == 0xE9)       // cmp cl, 0xE9
+	{
+		if (destReg != 1)
+			return false;
+	}
+	else
+	{
+		return false;
+	}
+
+	// Resolve the monitored function from the load feeding the movzx. Three forms
+	// appear; all of them write into baseReg.
+	uintptr_t target = 0;
+	uint8_t loadReg = 0xFF;
+
+	// Form 3: lea rax, [rip+disp]; mov rax, [rax]   (import, three-step; new in Sep)
+	const uint8_t* deref = reinterpret_cast<const uint8_t*>(address - 3);
+	if (address >= imageStart + 12
+		&& deref[0] == 0x48 && deref[1] == 0x8B
+		&& (deref[2] >> 6) == 0 && (deref[2] & 7) == ((deref[2] >> 3) & 7))
+	{
+		const uint8_t* load = reinterpret_cast<const uint8_t*>(address - 10);
+		if (load[0] == 0x48 && load[1] == 0x8D && (load[2] >> 6) == 0 && (load[2] & 7) == 5
+			&& ((load[2] >> 3) & 7) == ((deref[2] >> 3) & 7))
+		{
+			const uintptr_t slot = (address - 10) + 7 + ReadRel32(address - 10 + 3);
+			if (slot < imageStart || slot + sizeof(uintptr_t) > imageEnd)
+				return false;
+
+			memcpy(&target, reinterpret_cast<const void*>(slot), sizeof(target));
+			loadReg = (deref[2] >> 3) & 7;
+		}
+	}
+
+	// Forms 1 and 2: lea reg, [rip+disp] (internal) or mov reg, [rip+disp] (import).
+	if (loadReg == 0xFF && address >= imageStart + 7)
+	{
+		const uint8_t* load = reinterpret_cast<const uint8_t*>(address - 7);
+		if (load[0] == 0x48 && (load[1] == 0x8D || load[1] == 0x8B)
+			&& (load[2] >> 6) == 0 && (load[2] & 7) == 5)
+		{
+			const uintptr_t value = (address - 7) + 7 + ReadRel32(address - 7 + 3);
+
+			if (load[1] == 0x8D)
+			{
+				target = value;                                  // the function itself
+			}
+			else
+			{
+				if (value < imageStart || value + sizeof(uintptr_t) > imageEnd)
+					return false;
+
+				memcpy(&target, reinterpret_cast<const void*>(value), sizeof(target));
+			}
+
+			loadReg = (load[2] >> 3) & 7;
+		}
+	}
+
+	if (loadReg != baseReg || target == 0)
+		return false;
+
+	// The verdict byte: the first `cmp al, byte ptr [rip+disp]` after the unit body.
+	uintptr_t state = 0;
+	for (uintptr_t scan = address; scan < address + 128; ++scan)
+	{
+		const uint8_t* s = reinterpret_cast<const uint8_t*>(scan);
+		if (s[0] == 0x3A && s[1] == 0x05)
+		{
+			state = scan + 6 + ReadRel32(scan + 2);
+			break;
+		}
+	}
+
+	if (state < imageStart || state >= imageEnd)
+		return false;
+
+	out.checkAddress = address;
+	out.targetAddress = target;
+	out.stateAddress = state;
+	out.patchBytes[0] = 0x31;                                            // xor r32, r32
+	out.patchBytes[1] = static_cast<uint8_t>(0xC0 | (destReg << 3) | destReg);
+	out.patchBytes[2] = 0x90;                                            // nop
+	memcpy(out.originalBytes, p, sizeof(out.originalBytes));
+
+	return true;
+}
+
+static void EnumerateCheckUnits()
+{
+	s_checkUnits.clear();
+
+	const uintptr_t imageStart = reinterpret_cast<uintptr_t>(::GetModuleHandleA(nullptr));
+	const uintptr_t imageEnd = g_eqgameimagesize;
+
+	auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(imageStart);
+	auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS64*>(imageStart + dosHeader->e_lfanew);
+	auto* section = IMAGE_FIRST_SECTION(ntHeaders);
+
+	for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; ++i, ++section)
+	{
+		if ((section->Characteristics & IMAGE_SCN_CNT_CODE) == 0)
+			continue;
+
+		const uintptr_t sectionStart = imageStart + section->VirtualAddress;
+		const uintptr_t sectionEnd = sectionStart + section->Misc.VirtualSize;
+
+		for (uintptr_t address = sectionStart + 12; address + 8 < sectionEnd; ++address)
+		{
+			const uint8_t* p = reinterpret_cast<const uint8_t*>(address);
+			if (p[0] != 0x0F || p[1] != 0xB6)
+				continue;
+
+			HookCheckUnit unit;
+			if (DecodeCheckUnit(address, imageStart, imageEnd, unit))
+				s_checkUnits.push_back(unit);
+		}
+	}
+}
+
+static bool IsMonitoredTargetHooked(uintptr_t target)
+{
+	// Core hooks are in s_hooks. Plugin detours -- MQ2Bzsrch on
+	// CBazaarSearchWnd::HandleSearchResults is the one that matters -- only ever
+	// appear in the memory patcher's registry.
+	return IsHooked(target) || (g_mq != nullptr && g_mq->IsAddressPatched(target, 1));
+}
+
+// Idempotent: patches every unit whose monitored target is currently hooked and is
+// not already patched. Must run on the main thread (see the state-byte comment).
+static int ApplyHookScannerPatches()
+{
+	int applied = 0;
+
+	for (HookCheckUnit& unit : s_checkUnits)
+	{
+		if (unit.patched || !IsMonitoredTargetHooked(unit.targetAddress))
+			continue;
+
+		// Clear the client's stored verdict first. A unit reports on any *change*,
+		// including hooked -> clean, so if it has already latched "hooked" -- which
+		// happens when a plugin installs its detour after we last ran -- then letting
+		// it observe the patched clean verdict would itself emit a report. Both
+		// writes must land before the next DoMainLoop pass.
+		*reinterpret_cast<volatile uint8_t*>(unit.stateAddress) = 0;
+
+		if (!mq::AddPatch(unit.checkAddress, unit.patchBytes, sizeof(unit.patchBytes),
+			unit.originalBytes, "HookScannerCheck"))
+		{
+			LOG_ERROR("HookMemChecker - failed to patch check unit at 0x{:X} monitoring 0x{:X}",
+				unit.checkAddress, unit.targetAddress);
+			continue;
+		}
+
+		unit.patched = true;
+		s_patches.push_back(unit.checkAddress);
+		++applied;
+
+		LOG_DEBUG("HookMemChecker - blinded check unit at 0x{:X} monitoring 0x{:X}",
+			unit.checkAddress, unit.targetAddress);
+	}
+
+	return applied;
+}
+
+// Call after anything that may have installed a detour on a monitored function --
+// most importantly after a plugin's InitializePlugin has run.
+void UpdateHookScannerPatches()
+{
+	if (s_checkUnits.empty())
+		return;
+
+	if (const int applied = ApplyHookScannerPatches(); applied > 0)
+		LOG_INFO("HookMemChecker - blinded {} additional check unit(s)", applied);
+}
+
 static void HookMemChecker(bool Patch)
 {
 	LOG_DEBUG("HookMemChecker - {}atching", (Patch) ? "P" : "Unp");
@@ -477,22 +732,35 @@ static void HookMemChecker(bool Patch)
 
 		InstallHooks();
 
-		uintptr_t imageStart = (uintptr_t)::GetModuleHandleA(nullptr);
-		uintptr_t imageEnd = g_eqgameimagesize;
-		uintptr_t addr = imageStart;
-		constexpr uint8_t pattern[] = {
-			0x0F, 0xB6, 0x01, 0x3C, 0x00, 0x75, 0x00, 0xB0, 0x00, 0xEB,
-			0x00, 0x3C, 0x00, 0x75, 0x00, 0x0F, 0xB6, 0x49, 0x00, 0x80,
-			0xE9, 0x00, 0x80, 0xF9, 0x00, 0x77, 0x00, 0xB0, 0x00, 0xEB
-		};
-		uintptr_t deltas[] = { 5, 13 };
-		while ((addr = FindPattern(addr, imageEnd - addr, pattern, "xxxx?x?x?x?x?x?xxx?xx?xx?x?x?x")))
+		EnumerateCheckUnits();
+
+		// Fail loudly at zero. A signature that matches nothing is indistinguishable
+		// from a signature with nothing to match, and that is exactly how the previous
+		// implementation went days without protecting anything while logging "Patching".
+		if (s_checkUnits.empty())
 		{
-			uint8_t bytes[] = { 0x48, 0x8D, 0x0D };
-			if (memcmp(reinterpret_cast<void*>(addr - 7), bytes, 3) != 0
-				|| IsHooked(*reinterpret_cast<uint32_t*>(addr - 4) + addr))
-				for (uintptr_t delta : deltas) { mq::AddPatch(addr + delta, { 0xEB }); s_patches.push_back(addr + delta); }
-			addr += lengthof(pattern);
+			LOG_ERROR("HookMemChecker - FOUND NO CHECK UNITS. The client's hook scanner has "
+				"changed shape and MQ's hooks are being reported to the server. Re-derive the "
+				"check-unit signature before playing.");
+#if !defined(EMULATOR)
+			__debugbreak();
+#endif
+		}
+		else
+		{
+			const int applied = ApplyHookScannerPatches();
+
+			LOG_INFO("HookMemChecker - {} check units found, {} blinded",
+				s_checkUnits.size(), applied);
+
+			// __MemChecker4 is hooked unconditionally on live, so at least one unit must
+			// match. Zero means the offsets resolved somewhere the client isn't looking.
+			if (applied == 0)
+			{
+				LOG_ERROR("HookMemChecker - {} check units found but NONE monitors a hooked "
+					"function. Expected __MemChecker4 at minimum; offsets are likely wrong.",
+					s_checkUnits.size());
+			}
 		}
 	}
 	else
@@ -500,6 +768,7 @@ static void HookMemChecker(bool Patch)
 		RemoveHooks();
 		RemoveDetour(Spellmanager__LoadTextSpells);
 		mq::RemovePatch(__compress_block);
+		s_checkUnits.clear();
 	}
 }
 
@@ -527,7 +796,22 @@ void InitializeDetours()
 	AddHook(__MemChecker4, memcheck4, memcheck4_tramp);
 #endif
 #endif
-	AddHook(__decompress_block, decompress_block_detour, decompress_block_trampoline);
+	// DISABLED - do not re-enable without testing a zone-in.
+	//
+	// decompress_block_detour returns 0 for every call where s_inMemCheck4 is unset,
+	// i.e. for all real decompression. On the 2026-09-11 client that kills the game
+	// the moment you enter the world.
+	//
+	// This hook has in fact never been active here: __decompress_block (0x1405ABA40)
+	// lies inside the __compress_block patch region registered a few lines below, and
+	// MemoryPatcherImpl::AddPatchToList used to reject ANY overlap -- so CreateDetour
+	// returned nullptr and AddHook_ discarded the failure silently (it sets
+	// hi.address regardless, so IsHooked() still reported true). Relaxing that overlap
+	// check to permit detours inside read-only region markers made this hook install
+	// for the first time, which is what broke zone-in.
+	//
+	// Leaving it off restores the behaviour MQ has actually been shipping.
+	//AddHook(__decompress_block, decompress_block_detour, decompress_block_trampoline);
 
 	AddHook(__ModuleList, FindModules_Detour, FindModules_Trampoline);
 	AddHook(__ProcessList, FindProcesses_Detour, FindProcesses_Trampoline);

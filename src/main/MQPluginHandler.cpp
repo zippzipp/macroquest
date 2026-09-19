@@ -41,6 +41,9 @@ namespace mq {
 #define PluginDebug(...)
 #endif
 
+// MQDetourAPI.cpp
+void UpdateHookScannerPatches();
+
 // This is the main plugin list. We use it to preserve some sort of order, thats about it.
 MQPlugin* pPlugins = nullptr;
 
@@ -618,6 +621,12 @@ int LoadPlugin(std::string_view pluginName, bool save)
 	LoadCfgFile(autoExec.c_str(), false);
 
 	PluginsLoadPlugin(pPlugin->szFilename);
+
+	// A plugin may have detoured a function the client's hook scanner monitors --
+	// MQ2Bzsrch hooks CBazaarSearchWnd::HandleSearchResults, which is one of them.
+	// The scanner's check units were enumerated at startup, before this plugin
+	// existed, so re-run the gate now that its detours are installed.
+	UpdateHookScannerPatches();
 
 	if (save)
 	{
