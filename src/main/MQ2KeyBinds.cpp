@@ -29,6 +29,30 @@ using KeybindMap = std::map<std::string, int, ci_less>;
 KeybindMap gKeybindMap;
 std::vector<std::unique_ptr<MQKeyBind>> gKeyBinds;
 
+// Returns true if szEQMappableCommands[index] holds a usable command name.
+//
+// Entries below nNormalEQMappableCommands are named by the client, so their name
+// pointers must fall inside the eqgame image -- anything else is garbage. The
+// remaining entries are the ones MacroQuest names itself (see MacroQuest.cpp), and
+// those literals live in MQ2Main.dll, not in eqgame. Testing them against the
+// eqgame image range discards them whenever MQ2Main is mapped above eqgame, which
+// is what made names like INSTANT_CAMP unfindable.
+static bool IsValidMappableCommand(int index)
+{
+	if (index < 0 || index >= nEQMappableCommands)
+		return false;
+
+	const char* name = szEQMappableCommands[index];
+	if (name == nullptr)
+		return false;
+
+	if (index >= nNormalEQMappableCommands)
+		return true;
+
+	const uintptr_t addr = reinterpret_cast<uintptr_t>(name);
+	return addr >= EQGameBaseAddress && addr < g_eqgameimagesize;
+}
+
 void EnumerateKeyBinds(const std::function<void(const MQKeyBind& keyBind)>& func)
 {
 	for (const auto& [name, id] : gKeybindMap)
@@ -301,7 +325,7 @@ int FindMappableCommand(const char* name)
 {
 	for (int i = 0; i < nEQMappableCommands; i++)
 	{
-		if (szEQMappableCommands[i] == nullptr || szEQMappableCommands[i] > reinterpret_cast<const char*>(g_eqgameimagesize))
+		if (!IsValidMappableCommand(i))
 			continue;
 
 		if (!_stricmp(name, szEQMappableCommands[i]))
@@ -411,7 +435,7 @@ void MQ2KeyBindCommand(PlayerClient* pChar, const char* szLine)
 		// eq binds
 		for (int i = 0; i < nEQMappableCommands; i++)
 		{
-			if (szEQMappableCommands[i] == nullptr || szEQMappableCommands[i] > reinterpret_cast<const char*>(g_eqgameimagesize))
+			if (!IsValidMappableCommand(i))
 				continue;
 
 			if (pKeypressHandler->AltKey[i] == newCombo && SetEQKeyBindByNumber(i, true, ClearCombo))
@@ -490,7 +514,7 @@ bool DumpBinds(const char* Filename)
 
 	for (int index = 0; index < nEQMappableCommands; index++)
 	{
-		if (szEQMappableCommands[index] == nullptr || szEQMappableCommands[index] > reinterpret_cast<const char*>(g_eqgameimagesize))
+		if (!IsValidMappableCommand(index))
 			continue;
 
 		fprintf(file, "/bind %s %s\n", szEQMappableCommands[index],
